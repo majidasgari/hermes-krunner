@@ -19,11 +19,23 @@
   "session_rotate_after_messages": 60,
   "cache_size": 120,
   "inline_answer_chars": 1500,
-  "copy_to_clipboard": true,
+
+  "_comment_sending": "حین تایپ هیچ درخواستی به مدل نمی‌رود؛ فقط با اینتر، علامت سؤال در متن، یا نشانه پرسیده می‌شود",
+  "auto_ask": true,
+  "auto_ask_on_question_mark": true,
+  "debounce_ms": 700,
+  "min_question_chars": 3,
+
+  "_comment_suggestion": "برای هر متن ساده یک ردیف پیشنهاد «از هرمس بپرس» نشان داده می‌شود (بدون تماس با مدل)",
+  "suggest_untriggered": true,
+  "min_suggest_chars": 3,
+  "suggest_relevance": 0.5,
+  "suggest_category_relevance": 50,
+
   "notify": true,
   "notify_inline_answers": false,
   "show_hint_when_empty": true,
+  "app_window_class": ["com.nousresearch.hermes"],
   "idle_exit_minutes": 20,
-  "log_level": "INFO",
-  "triggers_note": "نشانه‌هایی که KRunner را وارد حالت پرسش از هرمس می‌کنند"
+  "log_level": "INFO"
 }
