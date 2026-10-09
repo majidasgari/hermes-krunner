@@ -166,8 +166,16 @@ class TestClassifyQuery(unittest.TestCase):
         self.assertEqual(self.mode("پایتخت استرالیا", suggest_untriggered=False)["mode"], "ignore")
 
     def test_triggered_query_asks(self):
-        for q in ("? پایتخت استرالیا کجاست؟", "؟ پایتخت استرالیا", "hermes: hello there", "هرمس سلام"):
+        """A trigger *with* a question mark still fires right away."""
+        for q in ("? پایتخت استرالیا کجاست؟", "؟ پایتخت استرالیا کجاست؟", "hermes: hello there?",
+                  "هرمس آدرس خونه خودم کجاست؟"):
             self.assertEqual(self.mode(q)["mode"], "ask", q)
+
+    def test_trigger_word_alone_does_not_ask(self):
+        """Typing a trigger word must not fire an ask for every prefix (the bug)."""
+        for q in ("هرمس آدرس خونه خودم", "هرمس آدرس خونه خودم فقط همیم", "hermes how are you",
+                  "کتی سلام"):
+            self.assertEqual(self.mode(q)["mode"], "suggest", q)
 
     def test_triggered_query_without_auto_ask_is_manual(self):
         self.assertEqual(self.mode("? پایتخت استرالیا کجاست", auto_ask=False)["mode"], "manual")
@@ -181,6 +189,40 @@ class TestClassifyQuery(unittest.TestCase):
 
     def test_empty_query_is_ignored(self):
         self.assertEqual(self.mode("")["mode"], "ignore")
+
+
+class TestSupersede(unittest.TestCase):
+    """Overlapping asks in one chat cancel each other in the app, so retire them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.asker = hk.Asker(dict(hk.DEFAULTS),
+                              cache=hk.AnswerCache(Path(self.tmp.name) / "a.json", 5))
+
+    def test_fuller_question_retires_the_older_ask(self):
+        older = hk.Ask("آدرس خونه خودم")
+        self.asker._inflight["k"] = older
+        self.asker._retire_superseded("آدرس خونه خودم فقط همیم")
+        self.assertTrue(older.superseded)
+
+    def test_unrelated_question_keeps_the_older_ask(self):
+        older = hk.Ask("آدرس خونه خودم")
+        self.asker._inflight["k"] = older
+        self.asker._retire_superseded("قیمت دلار امروز")
+        self.assertFalse(older.superseded)
+
+    def test_stale_when_a_fuller_question_is_already_on_its_way(self):
+        self.asker.cfg["supersede_grace_ms"] = 0
+        ask = hk.Ask("آدرس خونه")
+        self.asker._latest = (ask.created + 1, "آدرس خونه خودم")
+        self.assertTrue(self.asker._is_stale(ask))
+
+    def test_not_stale_when_nothing_newer_exists(self):
+        self.asker.cfg["supersede_grace_ms"] = 0
+        ask = hk.Ask("پایتخت ژاپن کجاست؟")
+        self.asker._latest = (ask.created, "پایتخت ژاپن کجاست؟")
+        self.assertFalse(self.asker._is_stale(ask))
 
 
 class TestFailureTexts(unittest.TestCase):

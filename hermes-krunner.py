@@ -65,7 +65,7 @@ DEFAULTS: dict = {
     "app_start_timeout_s": 60,
     # How long a KRunner match may hold its reply waiting for the answer
     # (KRunner's own D-Bus timeout is 25s — stay well below it).
-    "inline_wait_s": 18,
+    "inline_wait_s": 22,
     # Hard cap on a single ask.
     "answer_timeout_s": 240,
     # Start a fresh chat once the quick-ask chat has this many messages.
@@ -78,12 +78,17 @@ DEFAULTS: dict = {
     "answer_category_relevance": 100,
     "hint_category_relevance": 70,
     "show_hint_when_empty": True,
-    # Nothing is sent to the model while you are just typing:
-    # a query is asked when you press Enter, use a trigger word, or type "?".
+    # Ask while typing is off by design: a query is asked on Enter, on a question
+    # mark in the text, or (trigger words) on Enter as well.
     "auto_ask": True,
     "auto_ask_on_question_mark": True,
     "debounce_ms": 700,
     "min_question_chars": 3,
+    # One app turn at a time; a question that extends one in flight retires it.
+    "supersede_grace_ms": 400,
+    # If the previous turn still runs this long, ask anyway rather than make the
+    # user wait behind it (a superseded turn is dropped either way).
+    "app_turn_wait_s": 12,
     # Plain queries (no trigger word) still get a "از هرمس بپرس: …" suggestion row.
     "suggest_untriggered": True,
     "min_suggest_chars": 3,
@@ -206,23 +211,23 @@ def classify_query(cfg: dict, raw: str) -> dict:
     min_q = int(cfg.get("min_question_chars") or 3)
     min_s = int(cfg.get("min_suggest_chars") or 3)
     auto = bool(cfg.get("auto_ask", True))
+    # A question mark anywhere in what was typed is the "send it now" signal. A
+    # trigger word alone is *not*: it only marks the query as a Hermes question, so
+    # typing "هرمس آدرس خونه خودم" does not fire an ask for every prefix.
+    marked = any(ch in raw for ch in ("?", "؟")) and bool(cfg.get("auto_ask_on_question_mark", True))
     if not raw:
         return {"raw": raw, "triggered": False, "question": "", "mode": "ignore"}
-    if triggered:
-        if len(stripped) < min_q:
-            return {"raw": raw, "triggered": True, "question": stripped, "mode": "hint"}
-        return {"raw": raw, "triggered": True, "question": stripped,
-                "mode": "ask" if auto else "manual"}
-    if len(raw) < min_s:
-        return {"raw": raw, "triggered": False, "question": raw, "mode": "ignore"}
-    if not bool(cfg.get("suggest_untriggered", True)):
-        return {"raw": raw, "triggered": False, "question": raw, "mode": "ignore"}
-    # A question mark anywhere in the text is an explicit "ask this" signal, so a
-    # finished sentence ("… چی بود؟") goes straight to Hermes without an Enter.
-    marked = bool(cfg.get("auto_ask_on_question_mark", True)) and any(
-        ch in raw for ch in ("?", "؟"))
-    return {"raw": raw, "triggered": False, "question": raw,
-            "mode": "ask" if (marked and auto) else "suggest"}
+    if triggered and len(stripped) < min_q:
+        return {"raw": raw, "triggered": True, "question": stripped, "mode": "hint"}
+    question = stripped if triggered else raw
+    if len(question) < min_q or (not triggered and len(raw) < min_s):
+        return {"raw": raw, "triggered": triggered, "question": question, "mode": "ignore"}
+    if auto and marked:
+        return {"raw": raw, "triggered": triggered, "question": question, "mode": "ask"}
+    if not bool(cfg.get("suggest_untriggered", True)) and not triggered:
+        return {"raw": raw, "triggered": False, "question": question, "mode": "ignore"}
+    return {"raw": raw, "triggered": triggered, "question": question,
+            "mode": "manual" if triggered and not auto else "suggest"}
 
 
 def clip_answer(text: str, limit: int) -> str:
@@ -667,11 +672,16 @@ class CliEngine:
 
 # ── orchestration ────────────────────────────────────────────────────────────
 class Ask:
-    __slots__ = ("question", "started", "finished", "answer", "error", "engine", "session", "event")
+    __slots__ = ("question", "started", "created", "superseded", "finished", "answer",
+                 "error", "engine", "session", "event", "holding", "late_armed")
 
     def __init__(self, question: str):
         self.question = question
         self.started = time.monotonic()
+        self.created = self.started
+        self.superseded = False
+        self.holding = False   # a KRunner Match is holding its reply for this answer
+        self.late_armed = False
         self.finished: float | None = None
         self.answer = ""
         self.error = ""
@@ -696,6 +706,8 @@ class Asker:
         self.cache = cache if cache is not None else AnswerCache(CACHE_PATH, int(cfg.get("cache_size") or 120))
         self._lock = threading.Lock()
         self._inflight: dict = {}
+        self._latest: tuple = (0.0, "")   # (created, question) of the newest ask
+        self._app_turn = threading.Lock()  # one app turn at a time — overlaps cancel each other
 
     # -- engine selection ----------------------------------------------------
     def backend_up(self) -> bool:
@@ -742,7 +754,7 @@ class Asker:
 
     # -- asking --------------------------------------------------------------
     def start(self, question: str, *, force: bool = False, new_session: bool = False,
-              notify_when_done: bool = True) -> Ask:
+              notify_when_done: bool = True, holding: bool = False) -> Ask:
         key = question_key(question)
         if not force:
             cached = self.cache.get(question)
@@ -763,11 +775,46 @@ class Asker:
             if ask is not None and not ask.done and not force and not new_session:
                 return ask
             ask = Ask(question)
+            ask.holding = holding
             self._inflight[key] = ask
+            self._latest = (ask.created, question)
+        # A question that extends one already in flight makes that one obsolete: its
+        # answer would be about a half-typed sentence.
+        self._retire_superseded(question)
         threading.Thread(
             target=self._run_ask, args=(ask, force, new_session, notify_when_done),
             name="hermes-ask", daemon=True).start()
         return ask
+
+    def _retire_superseded(self, question: str) -> None:
+        new = question_key(question)
+        with self._lock:
+            running = [a for a in self._inflight.values() if not a.done and not a.superseded]
+        for old in running:
+            old_key = question_key(old.question)
+            if old_key and new != old_key and new.startswith(old_key):
+                old.superseded = True
+                log.info("ask retired (superseded): %r -> %r", old.question[:60], question[:60])
+
+    def _is_stale(self, ask: Ask) -> bool:
+        """True when a newer question that extends this one is already on its way.
+
+        Waits ``supersede_grace_ms`` first so a question arriving in the same burst
+        retires this one *before* it costs a turn in the app.
+        """
+        if ask.superseded:
+            return True
+        mine = question_key(ask.question)
+        deadline = time.monotonic() + max(0.0, float(self.cfg.get("supersede_grace_ms") or 400) / 1000.0)
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            if ask.superseded:
+                return True
+            newest_at, newest_q = self._latest
+            newest = question_key(newest_q)
+            if newest_at > ask.created and newest != mine and newest.startswith(mine):
+                return True
+        return ask.superseded
 
     def _run_ask(self, ask: Ask, force: bool, new_session: bool, notify_when_done: bool) -> None:
         cfg = self.cfg
@@ -782,33 +829,46 @@ class Asker:
                 # App is down: bring it up in the background, answer through the CLI
                 # engine in the meantime so KRunner still gets an inline answer.
                 self.launch_app_soon()
+            if app_up and not self._app_turn.acquire(
+                    timeout=float(cfg.get("app_turn_wait_s") or 30)):
+                log.warning("waited too long for the app to finish the previous turn")
             if app_up:
                 try:
-                    answer, stored = self.ask_via_app(
-                        ask.question,
-                        timeout=float(cfg.get("answer_timeout_s") or 240),
-                        session_title=None if not new_session else self._fresh_title(),
-                    )
-                    if answer:
-                        ask.answer = answer
-                        ask.engine = "app"
-                        ask.session = stored
+                    if self._is_stale(ask):
+                        log.info("ask skipped, a fuller question is on its way: %r", ask.question[:60])
+                        ask.error = "stale"
+                    else:
+                        answer, stored = self.ask_via_app(
+                            ask.question,
+                            timeout=float(cfg.get("answer_timeout_s") or 240),
+                            session_title=None if not new_session else self._fresh_title(),
+                        )
+                        if answer:
+                            ask.answer = answer
+                            ask.engine = "app"
+                            ask.session = stored
                 except (BackendUnavailable, RuntimeError, TimeoutError, OSError) as exc:
                     log.warning("app engine failed: %s", exc)
-            if ask.answer and looks_like_failure(ask.answer):
+                finally:
+                    try:
+                        self._app_turn.release()
+                    except RuntimeError:
+                        pass
+            stale = ask.superseded or ask.error == "stale"
+            if not stale and ask.answer and looks_like_failure(ask.answer):
                 # e.g. "⚠️ No reply: the request was cancelled…" — report it as an
                 # error and let the other engine have a go.
                 log.info("engine %s returned a failure text, not an answer", ask.engine or "app")
                 ask.error = clip_answer(ask.answer, 300)
                 ask.answer = ""
-            if not ask.answer and engine_pref in ("auto", "cli"):
+            if not stale and not ask.answer and engine_pref in ("auto", "cli"):
                 answer, session = CliEngine(cfg).ask(
                     ask.question, timeout=float(cfg.get("answer_timeout_s") or 240))
                 if answer:
                     ask.answer = answer
                     ask.engine = "cli"
                     ask.session = session
-            if not ask.answer and not ask.error:
+            if not stale and not ask.answer and not ask.error:
                 ask.error = "no answer"
         except Exception as exc:  # noqa: BLE001 — a runner must never die on one bad ask
             log.exception("ask failed")
@@ -819,10 +879,26 @@ class Asker:
             log.info(
                 "ask done engine=%s %.1fs chars=%d q=%r",
                 ask.engine or ask.error, ask.finished - started, len(ask.answer), ask.question[:70])
-            if ask.answer:
+            if ask.superseded:
+                log.info("ask dropped (superseded by a fuller question): %r", ask.question[:60])
+            elif ask.answer:
                 self.cache.put(ask.question, ask.answer, engine=ask.engine, session=ask.session)
-                if notify_when_done and cfg.get("notify"):
+                # Notify only when KRunner is *not* going to show it inline: the Match
+                # that is holding the reply takes over the late case itself.
+                if notify_when_done and cfg.get("notify") and not ask.holding:
                     self._notify_answer(ask)
+
+    def notify_when_late(self, ask: Ask) -> None:
+        """KRunner gave up waiting — announce the answer once it lands."""
+        if ask.late_armed:
+            return
+        ask.late_armed = True
+
+        def wait_and_notify() -> None:
+            ask.event.wait(float(self.cfg.get("answer_timeout_s") or 240))
+            if ask.answer and not ask.superseded and self.cfg.get("notify"):
+                self._notify_answer(ask)
+        threading.Thread(target=wait_and_notify, name="hermes-late-notify", daemon=True).start()
 
     def _fresh_title(self) -> str:
         return f"{self.cfg.get('session_title') or 'پرسش سریع'} · {time.strftime('%H:%M')}"
@@ -833,15 +909,36 @@ class Asker:
         notify(f"هرمس: {clip_answer(ask.question, 70)}", f"{body}\n({source})", timeout_ms=25000)
 
     def open_in_app(self, question: str) -> None:
-        """The default action: make sure the question reached the app, then raise its window."""
+        """Enter on a result: submit it if needed, show that chat in the app, raise it."""
         try:
             if self.backend_up():
-                # Already asked during Match (or ask it now) — the chat is in the app.
-                self.start(question, notify_when_done=False)
+                if not self.cache.get(question):
+                    self.start(question, notify_when_done=False)
+                threading.Thread(target=self._show_chat, name="hermes-show", daemon=True).start()
             else:
+                # Cold start: bring it up, then show the chat once it answers.
                 self.launch_app_soon(delay=0.0)
+                threading.Thread(target=self._show_chat_when_ready, name="hermes-show",
+                                 daemon=True).start()
         except Exception:  # noqa: BLE001
             log.debug("open_in_app could not submit", exc_info=True)
+        focus_app(self.cfg)
+
+    def _show_chat(self) -> None:
+        """Switch the app's view to the quick-ask chat (``session.resume`` drives it)."""
+        title = str(self.cfg.get("session_title") or "پرسش سریع")
+        try:
+            with AppBackend() as backend:
+                backend.ensure_session(title)
+            log.info("app view switched to chat %r", title)
+        except (BackendUnavailable, RuntimeError, TimeoutError, OSError) as exc:
+            log.debug("could not switch the app to the quick-ask chat: %s", exc)
+
+    def _show_chat_when_ready(self) -> None:
+        if not self.backend_ready(timeout=float(self.cfg.get("app_start_timeout_s") or 60)):
+            return
+        time.sleep(1.5)  # let the freshly started window map itself first
+        self._show_chat()
         focus_app(self.cfg)
 
     def answer_now(self, question: str, *, timeout: float, force: bool = False) -> tuple:
@@ -1015,18 +1112,21 @@ def serve(cfg: dict) -> int:
                     relevance=0.4, pending=True)], "a(sssida{sv})")
                 return
 
-        ask = state.asker.start(question)
+        ask = state.asker.start(question, holding=True)
         with state.lock:
             state.current_question = question
-        wait_s = float(cfg.get("inline_wait_s") or 18)
+        wait_s = float(cfg.get("inline_wait_s") or 22)
         if not state.asker.backend_up() and not ask.done:
             wait_s = 0.0
         if cfg.get("auto_ask", True) and wait_s > 0 and not ask.done:
             ask.event.wait(wait_s)
         pending = not ask.done
-        if not cfg.get("auto_ask", True) and not ask.done:
-            text = f"از هرمس بپرس: {question}"
-            sub = "Enter: پرسیدن و رفتن به هرمس"
+        if pending:
+            state.asker.notify_when_late(ask)
+        if ask.superseded and not ask.answer:
+            text = f"از هرمس می‌پرسم: {question}"
+            sub = "سؤال کامل‌تری دارد می‌آید…"
+            pending = True
         elif pending:
             text = f"از هرمس می‌پرسم: {question}"
             sub = "هرمس دارد فکر می‌کند… (پاسخ در نوتیفیکیشن می‌آید، و با یک تایپ دوباره این‌جا)"
