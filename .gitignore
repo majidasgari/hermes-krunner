@@ -1,0 +1,13 @@
+# runtime / local state
+__pycache__/
+*.pyc
+*.log
+*.pid
+answers.json
+config.json
+focus-window.js
+*.junk-backup
+# editors / OS
+.vscode/
+.idea/
+.DS_Store

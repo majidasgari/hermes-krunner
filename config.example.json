@@ -1,0 +1,29 @@
+{
+  "_comment": "هرمـس در KRunner — این فایل را در ~/.config/hermes-krunner/config.json بگذارید. هر کلید اختیاری است.",
+  "triggers": [
+    "?",
+    "؟",
+    "hermes",
+    "هرمس",
+    "ana",
+    "آنا",
+    "kattie",
+    "کتی"
+  ],
+  "session_title": "⚡ پرسش سریع",
+  "engine": "auto",
+  "launch_app_if_down": true,
+  "app_start_timeout_s": 60,
+  "inline_wait_s": 18,
+  "answer_timeout_s": 240,
+  "session_rotate_after_messages": 60,
+  "cache_size": 120,
+  "inline_answer_chars": 1500,
+  "copy_to_clipboard": true,
+  "notify": true,
+  "notify_inline_answers": false,
+  "show_hint_when_empty": true,
+  "idle_exit_minutes": 20,
+  "log_level": "INFO",
+  "triggers_note": "نشانه‌هایی که KRunner را وارد حالت پرسش از هرمس می‌کنند"
+}

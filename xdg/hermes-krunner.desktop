@@ -1,0 +1,19 @@
+[Desktop Entry]
+Name=Hermes
+Comment=از هرمس بپرس — Ask Hermes from KRunner (Alt+F2)
+Type=Service
+X-KDE-ServiceTypes=Plasma/Runner
+Icon=hermes
+X-Plasma-API=DBus
+X-Plasma-DBusRunner-Service=org.maxv.hermeskrunner
+X-Plasma-DBusRunner-Path=/runner
+X-Plasma-Runner-Min-Letter-Count=3
+X-Plasma-Runner-Syntaxes=هرمس :q:,hermes :q:
+X-Plasma-Runner-Syntax-Descriptions=از هرمس بپرس,Ask Hermes
+X-Plasma-Request-Actions-Once=true
+X-KDE-PluginInfo-Name=hermes-krunner
+X-KDE-PluginInfo-Author=Max
+X-KDE-PluginInfo-Email=max@maxv.local
+X-KDE-PluginInfo-Version=1.0.0
+X-KDE-PluginInfo-License=MIT
+X-KDE-PluginInfo-EnabledByDefault=true
