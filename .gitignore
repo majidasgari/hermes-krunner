@@ -11,3 +11,6 @@ focus-window.js
 .vscode/
 .idea/
 .DS_Store
+
+# max-file-manager UI state written when the folder is browsed
+.mfm.json
